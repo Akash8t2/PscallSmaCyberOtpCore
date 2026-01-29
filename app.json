@@ -10,7 +10,7 @@
   "env": {
     "AJAX_URL": {
       "description": "INTS AJAX URL",
-      "value": "http://144.217.66.209/ints/agent/res/data_smscdr.php"
+      "value": "https://pscall.net/client/res/data_smscdr.php"
     },
     "BOT_TOKEN": {
       "description": "Telegram Bot Token"
