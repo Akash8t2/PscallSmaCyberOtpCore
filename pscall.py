@@ -55,16 +55,22 @@ session.cookies.update(COOKIES)
 # ================= STATE =================
 
 def load_state():
+    """Safely load state from file"""
     if os.path.exists(STATE_FILE):
         try:
             with open(STATE_FILE, 'r') as f:
                 return json.load(f)
-        except Exception:
-            pass
+        except Exception as e:
+            logging.error(f"Error loading state: {e}")
     return {"last_uid": None}
 
 def save_state(state):
-    json.dump(state, open(STATE_FILE, "w"))
+    """Safely save state to file (NO FILE CORRUPTION)"""
+    try:
+        with open(STATE_FILE, "w") as f:
+            json.dump(state, f)
+    except Exception as e:
+        logging.error(f"Error saving state: {e}")
 
 STATE = load_state()
 
@@ -147,7 +153,7 @@ def build_payload():
     }
 
 def send_to_telegram(text, chat_id):
-    """Send message to Telegram"""
+    """Send message to Telegram with proper error logging"""
     url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
     payload = {
         "chat_id": chat_id,
@@ -168,9 +174,17 @@ def send_to_telegram(text, chat_id):
             ]
         }
     }
-    r = requests.post(url, json=payload, timeout=15)
-    if not r.ok:
-        logging.error("Telegram error: %s", r.text)
+    
+    try:
+        r = requests.post(url, json=payload, timeout=15)
+        if not r.ok:
+            # 🔧 Fix 3: Telegram error visibility (DEBUG HELP)
+            logging.error(f"Telegram error | chat={chat_id} | status={r.status_code} | {r.text[:100]}")
+            return False
+        return True
+    except Exception as e:
+        logging.error(f"Telegram connection error | chat={chat_id} | {e}")
+        return False
 
 # ================= CORE LOGIC =================
 
@@ -181,31 +195,52 @@ def fetch_pscall():
     try:
         r = session.get(AJAX_URL, params=build_payload(), timeout=20)
         
-        # 🔴 HTML / SESSION EXPIRED CHECK
-        if "text/html" in r.headers.get("Content-Type", "").lower():
-            logging.warning("⚠️ PSCALL session expired (HTML)")
+        # 🔧 Fix 4: HTML login page stronger detect
+        content_type = r.headers.get("Content-Type", "").lower()
+        response_text = r.text.lower()
+        
+        # Check if response is HTML (login page)
+        if "text/html" in content_type or "<!doctype html" in response_text or "<html" in response_text:
+            logging.warning("⚠️ PSCALL session expired - HTML login page detected")
             return
-
+        
+        # Check if response is empty or too small
+        if len(r.text.strip()) < 10:
+            logging.warning("⚠️ Empty response from PSCALL")
+            return
+        
         try:
             data = r.json()
-        except:
-            logging.warning("⚠️ Invalid JSON from PSCALL")
+        except json.JSONDecodeError as e:
+            logging.warning(f"⚠️ Invalid JSON from PSCALL: {e}")
+            logging.debug(f"Response preview: {r.text[:200]}")
             return
 
         rows = data.get("aaData", [])
         if not rows:
             return
 
-        # Filter valid rows
+        # 🔧 Fix 1: Dummy row + date validation (VERY IMPORTANT)
         valid = []
         for row in rows:
-            if (
-                isinstance(row, list)
-                and len(row) >= 5
-                and isinstance(row[0], str)
-                and row[0].startswith("20")
-            ):
-                valid.append(row)
+            if not isinstance(row, list):
+                continue
+            if len(row) < 5:
+                continue
+            if not isinstance(row[0], str):
+                continue
+            
+            # Skip dummy/summary rows (like "0,0.01,0,9")
+            if row[0].startswith("0,") or "," in row[0]:
+                continue
+            
+            # Strict datetime check
+            try:
+                datetime.strptime(row[0], "%Y-%m-%d %H:%M:%S")
+            except ValueError:
+                continue
+            
+            valid.append(row)
 
         if not valid:
             return
@@ -220,7 +255,7 @@ def fetch_pscall():
         row = valid[0]
         
         # Create unique ID
-        uid = row[0] + row[2] + row[4]
+        uid = f"{row[0]}_{row[2]}_{hash(str(row[4])[:50])}"
 
         # Check if already processed
         if STATE["last_uid"] == uid:
@@ -236,6 +271,7 @@ def fetch_pscall():
         # Extract OTP
         otp = extract_otp(message)
         if otp == "N/A":
+            logging.debug(f"No OTP found in message: {message[:50]}...")
             return
 
         # Mask phone number
@@ -257,41 +293,104 @@ def fetch_pscall():
 """
 
         # Send to all chats
+        success_count = 0
         for chat_id in CHAT_IDS:
-            send_to_telegram(text, chat_id)
-            time.sleep(1)  # Small delay
+            if send_to_telegram(text, chat_id):
+                success_count += 1
+                time.sleep(1)  # Small delay between sends
 
-        # Update state
-        STATE["last_uid"] = uid
-        save_state(STATE)
-        logging.info("LIVE OTP SENT")
+        if success_count > 0:
+            # Update state
+            STATE["last_uid"] = uid
+            save_state(STATE)
+            logging.info(f"✅ LIVE OTP SENT to {success_count} chats | OTP: {otp} | Number: {masked_number}")
+        else:
+            logging.error("❌ Failed to send OTP to any chat")
 
+    except requests.RequestException as e:
+        logging.error(f"Network error: {e}")
     except Exception as e:
-        logging.error(f"Error: {e}")
+        logging.error(f"Unexpected error in fetch_pscall: {e}")
+        import traceback
+        traceback.print_exc()
 
 # ================= MAIN =================
 
 def main():
     """Main function"""
-    logging.info("🚀 PSCALL.NET BOT STARTED")
-    logging.info(f"Bot Token: {'✓' if BOT_TOKEN else '✗'}")
-    logging.info(f"Session ID: {'✓' if PHPSESSID else '✗'}")
-    logging.info(f"Chat IDs: {CHAT_IDS}")
+    logging.info("=" * 60)
+    logging.info("🚀 PSCALL.NET BOT STARTED (PRODUCTION READY)")
+    logging.info("=" * 60)
     
     # Check environment
     if not BOT_TOKEN:
-        logging.error("BOT_TOKEN not set!")
-        return
-    if not PHPSESSID:
-        logging.error("PHPSESSID not set!")
+        logging.error("❌ BOT_TOKEN not set in environment variables!")
+        logging.error("Set with: heroku config:set BOT_TOKEN=your_token")
         return
     
+    if not PHPSESSID:
+        logging.error("❌ PHPSESSID not set in environment variables!")
+        logging.error("Set with: heroku config:set PHPSESSID=your_session_id")
+        logging.error("Get session ID from browser after logging into PSCall.net")
+        return
+    
+    logging.info(f"✅ Bot Token: {'Set' if BOT_TOKEN else 'Not Set'}")
+    logging.info(f"✅ Session ID: {'Set' if PHPSESSID else 'Not Set'}")
+    logging.info(f"✅ Chat IDs: {CHAT_IDS}")
+    logging.info(f"✅ Check Interval: {CHECK_INTERVAL} seconds")
+    logging.info("=" * 60)
+    logging.info("Features:")
+    logging.info("  ✅ Phone number masking (e.g., 252***5847)")
+    logging.info("  ✅ Dummy row filtering")
+    logging.info("  ✅ Session expiry detection")
+    logging.info("  ✅ State persistence")
+    logging.info("  ✅ 5-button Telegram interface")
+    logging.info("  ✅ Powered by @Rohit512R")
+    logging.info("=" * 60)
+    
+    # Test session on startup
+    try:
+        logging.info("Testing PSCall.net connection...")
+        test_params = build_payload()
+        test_params["iDisplayLength"] = 5  # Small test
+        response = session.get(AJAX_URL, params=test_params, timeout=10)
+        
+        if response.status_code == 200:
+            try:
+                data = response.json()
+                row_count = len(data.get("aaData", []))
+                logging.info(f"✅ Connection successful | Found {row_count} rows")
+            except:
+                logging.warning("⚠️ Got response but not valid JSON")
+        else:
+            logging.error(f"❌ Connection failed | HTTP {response.status_code}")
+    except Exception as e:
+        logging.error(f"❌ Connection test error: {e}")
+    
     # Main loop
+    logging.info("Starting main monitoring loop...")
+    logging.info("=" * 60)
+    
+    error_count = 0
+    max_errors = 5
+    
     while True:
         try:
             fetch_pscall()
+            error_count = 0  # Reset error count on success
+            
+        except KeyboardInterrupt:
+            logging.info("Bot stopped by user")
+            break
         except Exception as e:
-            logging.error(f"Loop error: {e}")
+            error_count += 1
+            logging.error(f"Main loop error ({error_count}/{max_errors}): {e}")
+            
+            if error_count >= max_errors:
+                logging.error("Too many errors. Waiting 60 seconds...")
+                time.sleep(60)
+                error_count = 0
+        
         time.sleep(CHECK_INTERVAL)
 
 if __name__ == "__main__":
