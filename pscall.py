@@ -5,67 +5,44 @@ import re
 import logging
 import json
 import os
-import random
 from datetime import datetime, timedelta
 from urllib.parse import urlencode
 import html
-import threading
-from queue import Queue
 
 # ================= CONFIG =================
 
-# Multiple website configurations
-WEBSITES = {
-    "pscall_net": {
-        "name": "PSCall.net",
-        "url": "https://pscall.net/client/res/data_smscdr.php",
-        "type": "client",
-        "columns": 7,
-        "referer": "https://pscall.net/client/smscdr.php",
-        "date_range": 2  # Days to look back
-    },
-    "ints_agent": {
-        "name": "INTS Agent",
-        "url": "http://54.36.173.235/ints/agent/res/data_smscdr.php",
-        "type": "agent",
-        "columns": 9,
-        "referer": "http://54.36.173.235/ints/agent/smscdr.php",
-        "date_range": 1
-    },
-    "ints_client": {
-        "name": "INTS Client",
-        "url": "http://109.236.84.81/ints/client/res/data_smscdr.php",
-        "type": "client",
-        "columns": 7,
-        "referer": "http://109.236.84.81/ints/client/smscdr.php",
-        "date_range": 1
-    }
-}
-
-# Active website (can be changed via environment variable)
-ACTIVE_WEBSITE = os.getenv("ACTIVE_WEBSITE", "pscall_net")
+# Website configuration for PSCall.net (CLIENT interface)
+AJAX_URL = "https://pscall.net/client/res/data_smscdr.php"
+REFERER_URL = "https://pscall.net/client/smscdr.php"
 
 # Bot Configuration - ALL from environment variables
 BOT_TOKEN = os.getenv("BOT_TOKEN", "")
 CHAT_IDS = os.getenv("CHAT_IDS", "-1003559187782,-1003316982194").split(",")
 
-# Cookies - from environment variable
+# Cookies - from environment variable (PSCall.net session)
 PHPSESSID = os.getenv("PHPSESSID", "")
 COOKIES = {
     "PHPSESSID": PHPSESSID
 }
 
 HEADERS = {
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
     "X-Requested-With": "XMLHttpRequest",
     "Accept": "application/json, text/javascript, */*; q=0.01",
     "Accept-Language": "en-US,en;q=0.9",
+    "Accept-Encoding": "gzip, deflate, br",
     "Connection": "keep-alive",
     "Cache-Control": "no-cache",
-    "Pragma": "no-cache"
+    "Pragma": "no-cache",
+    "Referer": REFERER_URL,
+    "Sec-Fetch-Dest": "empty",
+    "Sec-Fetch-Mode": "cors",
+    "Sec-Fetch-Site": "same-origin",
+    "DNT": "1",
+    "Sec-GPC": "1"
 }
 
-CHECK_INTERVAL = 10  # seconds
+CHECK_INTERVAL = 15  # Check every 15 seconds
 STATE_FILE = "state.json"
 
 # Button URLs - ALL from environment variables
@@ -89,38 +66,23 @@ logging.basicConfig(
 # Suppress urllib3 warnings
 logging.getLogger("urllib3").setLevel(logging.WARNING)
 
-# Create session for each website
-sessions = {}
-for site_id, site_config in WEBSITES.items():
-    session = requests.Session()
-    session.headers.update(HEADERS.copy())
-    session.headers["Referer"] = site_config["referer"]
-    session.cookies.update(COOKIES)
-    sessions[site_id] = session
+# Create session
+session = requests.Session()
+session.headers.update(HEADERS)
+session.cookies.update(COOKIES)
 
 # ================= STATE =================
 
 def load_state():
-    """Load bot state from file"""
     if os.path.exists(STATE_FILE):
         try:
             with open(STATE_FILE, 'r') as f:
                 return json.load(f)
         except Exception as e:
             logging.error(f"Error loading state: {e}")
-    
-    # Initialize state for each website
-    state = {}
-    for site_id in WEBSITES.keys():
-        state[site_id] = {
-            "last_uid": None,
-            "processed_ids": [],
-            "last_check": None
-        }
-    return state
+    return {"last_uid": None, "processed_ids": []}
 
 def save_state(state):
-    """Save bot state to file"""
     try:
         with open(STATE_FILE, 'w') as f:
             json.dump(state, f, indent=2)
@@ -142,17 +104,15 @@ def mask_phone_number(number):
     if len(cleaned) < 7:
         return cleaned  # Too short to mask
     
-    # Format: +XXX***XXXX
-    country_code = cleaned[:3] if len(cleaned) > 10 else cleaned[:2] if len(cleaned) > 9 else ""
-    if country_code:
-        main_number = cleaned[len(country_code):]
-        if len(main_number) >= 4:
-            masked = f"+{country_code}{'*' * (len(main_number) - 4)}{main_number[-4:]}"
-            return masked
+    # For Somalia numbers like 252652015847
+    # Format: 252***5847 (show country code + last 4 digits)
+    if cleaned.startswith("252") and len(cleaned) > 6:
+        # Keep first 3 digits (country code) and last 4 digits
+        return f"{cleaned[:3]}***{cleaned[-4:]}"
     
-    # Fallback: Show first 3 and last 4
+    # For other numbers, show first 3 and last 4 digits
     if len(cleaned) >= 7:
-        return f"+{cleaned[:3]}****{cleaned[-4:]}"
+        return f"{cleaned[:3]}***{cleaned[-4:]}"
     
     return cleaned
 
@@ -201,110 +161,87 @@ def clean_phone_number(number):
         return f"+{cleaned}"
     return number
 
-def build_payload(website_config):
-    """Build AJAX payload based on website type"""
+def build_payload():
+    """Build AJAX payload for PSCall.net CLIENT interface (7 columns)"""
     today = datetime.now()
-    start_date = today - timedelta(days=website_config["date_range"])
+    yesterday = today - timedelta(days=1)
     
-    fdate1 = start_date.strftime("%Y-%m-%d 00:00:00")
+    fdate1 = yesterday.strftime("%Y-%m-%d 00:00:00")
     fdate2 = today.strftime("%Y-%m-%d 23:59:59")
     timestamp = int(time.time() * 1000)
     
-    # Common parameters
     params = {
         "fdate1": fdate1,
         "fdate2": fdate2,
+        "frange": "",
+        "fnum": "",
+        "fcli": "",
+        "fgdate": "",
+        "fgmonth": "",
+        "fgrange": "",
+        "fgnumber": "",
+        "fgcli": "",
+        "fg": 0,
         "sEcho": 1,
+        "iColumns": 7,  # 7 columns for client interface
+        "sColumns": ",,,,,,",  # 6 commas for 7 columns
         "iDisplayStart": 0,
         "iDisplayLength": 25,
+        "mDataProp_0": 0,
+        "sSearch_0": "",
+        "bRegex_0": "false",
+        "bSearchable_0": "true",
+        "bSortable_0": "true",
+        "mDataProp_1": 1,
+        "sSearch_1": "",
+        "bRegex_1": "false",
+        "bSearchable_1": "true",
+        "bSortable_1": "true",
+        "mDataProp_2": 2,
+        "sSearch_2": "",
+        "bRegex_2": "false",
+        "bSearchable_2": "true",
+        "bSortable_2": "true",
+        "mDataProp_3": 3,
+        "sSearch_3": "",
+        "bRegex_3": "false",
+        "bSearchable_3": "true",
+        "bSortable_3": "true",
+        "mDataProp_4": 4,
+        "sSearch_4": "",
+        "bRegex_4": "false",
+        "bSearchable_4": "true",
+        "bSortable_4": "true",
+        "mDataProp_5": 5,
+        "sSearch_5": "",
+        "bRegex_5": "false",
+        "bSearchable_5": "true",
+        "bSortable_5": "true",
+        "mDataProp_6": 6,
+        "sSearch_6": "",
+        "bRegex_6": "false",
+        "bSearchable_6": "true",
+        "bSortable_6": "true",
+        "sSearch": "",
+        "bRegex": "false",
         "iSortCol_0": 0,
         "sSortDir_0": "desc",
         "iSortingCols": 1,
         "_": timestamp
     }
     
-    # Type-specific parameters
-    if website_config["type"] == "agent":
-        params.update({
-            "frange": "",
-            "fclient": "",
-            "fnum": "",
-            "fcli": "",
-            "fgdate": "",
-            "fgmonth": "",
-            "fgrange": "",
-            "fgclient": "",
-            "fgnumber": "",
-            "fgcli": "",
-            "fg": 0,
-            "iColumns": 9,
-            "sColumns": ",,,,,,,,",
-        })
-        
-        # Add mDataProp parameters for agent
-        for i in range(9):
-            params[f"mDataProp_{i}"] = i
-            params[f"sSearch_{i}"] = ""
-            params[f"bRegex_{i}"] = "false"
-            params[f"bSearchable_{i}"] = "true"
-            params[f"bSortable_{i}"] = "true"
-        
-        # Last column not sortable
-        params["bSortable_8"] = "false"
-        
-    else:  # client type
-        params.update({
-            "frange": "",
-            "fnum": "",
-            "fcli": "",
-            "fgdate": "",
-            "fgmonth": "",
-            "fgrange": "",
-            "fgnumber": "",
-            "fgcli": "",
-            "fg": 0,
-            "iColumns": 7,
-            "sColumns": ",,,,,,",
-        })
-        
-        # Add mDataProp parameters for client
-        for i in range(7):
-            params[f"mDataProp_{i}"] = i
-            params[f"sSearch_{i}"] = ""
-            params[f"bRegex_{i}"] = "false"
-            params[f"bSearchable_{i}"] = "true"
-            params[f"bSortable_{i}"] = "true"
-    
-    params["sSearch"] = ""
-    params["bRegex"] = "false"
-    
     return params
 
-def format_message(row, website_config):
-    """Format SMS data into HTML Telegram message"""
+def format_message(row):
+    """Format SMS data into HTML Telegram message for PSCall.net CLIENT interface (7 columns)"""
     try:
-        # Different column structures for different website types
-        if website_config["type"] == "agent":
-            # Agent: [date, route, number, service, null, message, currency, cost, status]
-            date = row[0] if len(row) > 0 else "N/A"
-            route = row[1] if len(row) > 1 else "Unknown"
-            number = clean_phone_number(row[2]) if len(row) > 2 else "N/A"
-            service = row[3] if len(row) > 3 else "Unknown"
-            
-            # Message might be in column 5
-            message = ""
-            if len(row) > 5 and row[5]:
-                message = row[5]
-            elif len(row) > 4 and row[4]:
-                message = row[4]
-        
-        else:  # client type
-            # Client: [date, route, number, service, message, currency, cost]
-            date = row[0] if len(row) > 0 else "N/A"
-            route = row[1] if len(row) > 1 else "Unknown"
-            number = clean_phone_number(row[2]) if len(row) > 2 else "N/A"
-            service = row[3] if len(row) > 3 else "Unknown"
-            message = row[4] if len(row) > 4 else ""
+        # PSCall.net CLIENT interface has 7 columns
+        # Based on sample: [date, route, number, service, message, currency, cost]
+        date = row[0] if len(row) > 0 else "N/A"
+        route = row[1] if len(row) > 1 else "Unknown"
+        number = clean_phone_number(row[2]) if len(row) > 2 else "N/A"
+        service = row[3] if len(row) > 3 else "Unknown"
+        message = row[4] if len(row) > 4 else ""
         
         # Extract country from route
         country = "Unknown"
@@ -395,48 +332,81 @@ def send_telegram(text, chat_id, retry_count=3):
                 return True
             else:
                 error_data = response.json()
+                logging.error(f"Telegram API error (attempt {attempt+1}/{retry_count}): {error_data.get('description', 'Unknown error')}")
                 if attempt < retry_count - 1:
                     time.sleep(2)  # Wait before retry
         except Exception as e:
+            logging.error(f"Error sending to Telegram (attempt {attempt+1}/{retry_count}): {e}")
             if attempt < retry_count - 1:
                 time.sleep(2)
-            else:
-                logging.error(f"Error sending to Telegram (chat {chat_id}): {e}")
     
     return False
 
 # ================= CORE LOGIC =================
 
-def fetch_website_sms(site_id, site_config):
-    """Fetch latest SMS from specific website"""
+def check_session_valid():
+    """Check if the session is still valid by making a test request"""
+    try:
+        # Try to access the main page first
+        test_response = session.get(REFERER_URL, timeout=10)
+        
+        if test_response.status_code != 200:
+            logging.error(f"Session check failed: HTTP {test_response.status_code}")
+            return False
+        
+        # Check if we're redirected to login page
+        if "login" in test_response.url.lower() or "index.php" in test_response.url.lower():
+            logging.error("Session expired: Redirected to login page")
+            return False
+        
+        return True
+    except Exception as e:
+        logging.error(f"Session check error: {e}")
+        return False
+
+def fetch_latest_sms():
+    """Fetch latest SMS from PSCall.net website"""
     global STATE
     
-    if site_id not in STATE:
-        STATE[site_id] = {"last_uid": None, "processed_ids": [], "last_check": None}
-    
     try:
-        session = sessions[site_id]
-        params = build_payload(site_config)
+        # First check if session is valid
+        if not check_session_valid():
+            logging.error("Session invalid. Please update PHPSESSID in environment variables.")
+            return
         
-        logging.debug(f"Fetching data from {site_config['name']} ({site_config['url']})")
-        response = session.get(site_config["url"], params=params, timeout=30)
+        params = build_payload()
+        
+        logging.info(f"Fetching data from PSCall.net")
+        response = session.get(AJAX_URL, params=params, timeout=30)
         
         if response.status_code != 200:
-            logging.error(f"HTTP Error for {site_config['name']}: {response.status_code}")
-            return None
+            logging.error(f"HTTP Error: {response.status_code}")
+            logging.debug(f"Response text: {response.text[:500]}")
+            return
+        
+        # Log response headers for debugging
+        logging.debug(f"Response Content-Type: {response.headers.get('Content-Type', 'Unknown')}")
+        logging.debug(f"Response Length: {len(response.text)}")
+        
+        # Check if response is HTML (login page)
+        if 'text/html' in response.headers.get('Content-Type', '').lower():
+            logging.error("Received HTML response instead of JSON. Session may be expired.")
+            logging.debug(f"HTML response start: {response.text[:200]}")
+            return
         
         try:
             data = response.json()
         except json.JSONDecodeError as e:
-            logging.error(f"JSON decode error for {site_config['name']}: {e}")
-            return None
+            logging.error(f"JSON decode error: {e}")
+            logging.debug(f"Raw response (first 500 chars): {response.text[:500]}")
+            return
         
         rows = data.get("aaData", [])
         if not rows:
-            logging.debug(f"No data found in {site_config['name']} response")
-            return None
+            logging.debug("No data found in response")
+            return
         
-        logging.info(f"{site_config['name']}: Found {len(rows)} total rows")
+        logging.info(f"Found {len(rows)} total rows")
         
         # Filter valid rows
         valid_rows = []
@@ -444,12 +414,9 @@ def fetch_website_sms(site_id, site_config):
             if not isinstance(row, list) or len(row) < 5:
                 continue
             
-            # Skip summary rows (different patterns for different sites)
-            if isinstance(row[0], str):
-                if site_config["type"] == "agent" and row[0].startswith("0,0.01,0,"):
-                    continue
-                elif row[0].startswith("0,0,0,"):
-                    continue
+            # Skip summary rows (they start with "0,0.01,0," for PSCall.net)
+            if isinstance(row[0], str) and row[0].startswith("0,0.01,0,"):
+                continue
             
             # Check for valid date format
             if not row[0] or not re.match(r'\d{4}-\d{2}-\d{2}', str(row[0])):
@@ -457,10 +424,10 @@ def fetch_website_sms(site_id, site_config):
             
             valid_rows.append(row)
         
-        logging.info(f"{site_config['name']}: Valid SMS rows: {len(valid_rows)}")
+        logging.info(f"Valid SMS rows: {len(valid_rows)}")
         
         if not valid_rows:
-            return None
+            return
         
         # Sort by date (newest first)
         valid_rows.sort(
@@ -468,69 +435,57 @@ def fetch_website_sms(site_id, site_config):
             reverse=True
         )
         
-        return valid_rows[0]  # Return newest row
+        # Process newest row
+        newest = valid_rows[0]
+        
+        # Create unique ID
+        sms_id = f"{newest[0]}_{newest[2]}"
+        if len(newest) > 4 and newest[4]:
+            sms_id += f"_{hash(str(newest[4])[:50])}"
+        
+        # Check if already processed
+        if STATE["last_uid"] == sms_id or sms_id in STATE.get("processed_ids", []):
+            logging.debug("No new SMS found")
+            return
+        
+        logging.info(f"New SMS detected: {newest[2]} at {newest[0]}")
+        
+        # Format message
+        formatted_msg = format_message(newest)
+        if not formatted_msg:
+            logging.error("Failed to format message")
+            return
+        
+        # Send to all chat IDs
+        success_count = 0
+        for chat_id in CHAT_IDS:
+            if send_telegram(formatted_msg, chat_id):
+                success_count += 1
+                time.sleep(1)  # Small delay between sends
+        
+        if success_count > 0:
+            logging.info(f"OTP sent to {success_count} chats for {newest[2]}")
+            
+            # Update state
+            STATE["last_uid"] = sms_id
+            
+            # Keep track of processed IDs
+            processed_ids = STATE.get("processed_ids", [])
+            processed_ids.append(sms_id)
+            if len(processed_ids) > 200:
+                processed_ids = processed_ids[-200:]
+            STATE["processed_ids"] = processed_ids
+            
+            save_state(STATE)
+        else:
+            logging.error("Failed to send to any chat")
         
     except requests.RequestException as e:
-        logging.error(f"Network error for {site_config['name']}: {e}")
+        logging.error(f"Network error: {e}")
     except Exception as e:
-        logging.error(f"Unexpected error for {site_config['name']}: {e}")
-    
-    return None
-
-def process_sms(newest, site_id, site_config):
-    """Process and send SMS"""
-    global STATE
-    
-    # Create unique ID
-    sms_id = f"{site_id}_{newest[0]}_{newest[2]}"
-    if site_config["type"] == "agent" and len(newest) > 5 and newest[5]:
-        sms_id += f"_{hash(str(newest[5])[:50])}"
-    elif len(newest) > 4 and newest[4]:
-        sms_id += f"_{hash(str(newest[4])[:50])}"
-    
-    # Check if already processed
-    site_state = STATE.get(site_id, {"processed_ids": []})
-    if sms_id in site_state.get("processed_ids", []):
-        logging.debug(f"No new SMS found in {site_config['name']}")
-        return False
-    
-    logging.info(f"{site_config['name']}: New SMS detected: {newest[2]} at {newest[0]}")
-    
-    # Format message
-    formatted_msg = format_message(newest, site_config)
-    if not formatted_msg:
-        logging.error(f"Failed to format message from {site_config['name']}")
-        return False
-    
-    # Send to all chat IDs
-    success_count = 0
-    for chat_id in CHAT_IDS:
-        if send_telegram(formatted_msg, chat_id):
-            success_count += 1
-            time.sleep(0.5)  # Small delay between sends
-    
-    if success_count > 0:
-        logging.info(f"{site_config['name']}: OTP sent to {success_count} chats for {newest[2]}")
-        
-        # Update state
-        if site_id not in STATE:
-            STATE[site_id] = {"last_uid": None, "processed_ids": []}
-        
-        STATE[site_id]["last_uid"] = sms_id
-        
-        # Keep track of processed IDs
-        processed_ids = STATE[site_id].get("processed_ids", [])
-        processed_ids.append(sms_id)
-        if len(processed_ids) > 200:
-            processed_ids = processed_ids[-200:]
-        STATE[site_id]["processed_ids"] = processed_ids
-        STATE[site_id]["last_check"] = datetime.now().isoformat()
-        
-        save_state(STATE)
-        return True
-    else:
-        logging.error(f"{site_config['name']}: Failed to send to any chat")
-        return False
+        logging.error(f"Unexpected error: {e}")
+        import traceback
+        traceback.print_exc()
 
 def check_environment():
     """Check if all required environment variables are set"""
@@ -543,7 +498,7 @@ def check_environment():
     
     if missing_vars:
         logging.warning(f"Missing environment variables: {', '.join(missing_vars)}")
-        logging.warning("Using default values. This may not work properly.")
+        logging.warning("Bot will not work without these variables.")
         return False
     
     return True
@@ -551,21 +506,17 @@ def check_environment():
 def print_config():
     """Print configuration details"""
     logging.info("=" * 60)
-    logging.info("🚀 MULTI-SITE OTP BOT STARTED")
+    logging.info("🚀 PSCall.net OTP BOT STARTED")
     logging.info("=" * 60)
-    logging.info(f"Active Website: {WEBSITES[ACTIVE_WEBSITE]['name']}")
+    logging.info(f"Website: PSCall.net (Client Interface)")
+    logging.info(f"URL: {AJAX_URL}")
     logging.info(f"Chat IDs: {', '.join(CHAT_IDS)}")
     logging.info(f"Check Interval: {CHECK_INTERVAL} seconds")
     logging.info(f"Mask Phone Numbers: {MASK_PHONE}")
     logging.info("=" * 60)
-    logging.info("Available Websites:")
-    for site_id, config in WEBSITES.items():
-        status = "✓ ACTIVE" if site_id == ACTIVE_WEBSITE else "○ INACTIVE"
-        logging.info(f"  {status} {config['name']} ({config['type']})")
-    logging.info("=" * 60)
     logging.info("Authentication:")
-    logging.info(f"Bot Token: {'✓ Set' if os.getenv('BOT_TOKEN') else '✗ Using default'}")
-    logging.info(f"Session ID: {'✓ Set' if os.getenv('PHPSESSID') else '✗ Using default'}")
+    logging.info(f"Bot Token: {'✓ Set' if os.getenv('BOT_TOKEN') else '✗ NOT SET'}")
+    logging.info(f"Session ID: {'✓ Set' if os.getenv('PHPSESSID') else '✗ NOT SET'}")
     logging.info("=" * 60)
     logging.info("Button Configuration:")
     logging.info(f"1. 🧑‍💻 Dev: {DEVELOPER_URL}")
@@ -575,29 +526,65 @@ def print_config():
     logging.info(f"5. 🆘 Support 2: {SUPPORT_URL_2}")
     logging.info("=" * 60)
 
+def test_connection():
+    """Test connection to PSCall.net"""
+    logging.info("Testing connection to PSCall.net...")
+    
+    try:
+        # First test session
+        if check_session_valid():
+            logging.info("✓ Session is valid")
+        else:
+            logging.error("✗ Session is invalid. Please update PHPSESSID.")
+            return False
+        
+        # Test API call
+        params = build_payload()
+        response = session.get(AJAX_URL, params=params, timeout=15)
+        
+        if response.status_code == 200:
+            try:
+                data = response.json()
+                rows = len(data.get("aaData", []))
+                logging.info(f"✓ API connection successful ({rows} rows found)")
+                return True
+            except json.JSONDecodeError:
+                logging.error("✗ API returned non-JSON response")
+                return False
+        else:
+            logging.error(f"✗ API connection failed: HTTP {response.status_code}")
+            return False
+            
+    except Exception as e:
+        logging.error(f"✗ Connection test failed: {e}")
+        return False
+
 # ================= MAIN =================
 
 def main():
     """Main function"""
     # Check environment
     if not check_environment():
-        logging.warning("Environment check failed. Bot may not work properly.")
+        logging.error("Critical environment variables missing. Exiting.")
+        return
     
     print_config()
     
+    # Test connection
+    if not test_connection():
+        logging.error("Connection test failed. Please check your configuration.")
+        logging.error("1. Make sure PHPSESSID is correct")
+        logging.error("2. Make sure you're logged into PSCall.net")
+        logging.error("3. Check if the website is accessible")
+        return
+    
     # Main loop
     error_count = 0
-    max_errors = 5
+    max_errors = 10
     
     while True:
         try:
-            # Fetch from active website
-            site_config = WEBSITES[ACTIVE_WEBSITE]
-            newest_sms = fetch_website_sms(ACTIVE_WEBSITE, site_config)
-            
-            if newest_sms:
-                process_sms(newest_sms, ACTIVE_WEBSITE, site_config)
-            
+            fetch_latest_sms()
             error_count = 0  # Reset error count on success
             
         except KeyboardInterrupt:
@@ -614,33 +601,5 @@ def main():
         
         time.sleep(CHECK_INTERVAL)
 
-def test_website_connection():
-    """Test connection to all websites"""
-    logging.info("Testing website connections...")
-    
-    for site_id, site_config in WEBSITES.items():
-        try:
-            session = sessions[site_id]
-            params = build_payload(site_config)
-            
-            response = session.get(site_config["url"], params=params, timeout=10)
-            
-            if response.status_code == 200:
-                try:
-                    data = response.json()
-                    rows = len(data.get("aaData", []))
-                    logging.info(f"✓ {site_config['name']}: Connected ({rows} rows)")
-                except:
-                    logging.info(f"✓ {site_config['name']}: Connected (non-JSON response)")
-            else:
-                logging.error(f"✗ {site_config['name']}: HTTP {response.status_code}")
-                
-        except Exception as e:
-            logging.error(f"✗ {site_config['name']}: {str(e)}")
-
 if __name__ == "__main__":
-    # Test connections first
-    test_website_connection()
-    
-    # Run main bot
     main()
