@@ -13,7 +13,7 @@ import html
 
 # Website configuration for PSCall.net (CLIENT interface)
 AJAX_URL = "https://pscall.net/client/res/data_smscdr.php"
-REFERER_URL = "https://pscall.net/client/smscdr.php"
+BASE_URL = "https://pscall.net/client/index.php"  # Changed from smscdr.php
 
 # Bot Configuration - ALL from environment variables
 BOT_TOKEN = os.getenv("BOT_TOKEN", "")
@@ -34,7 +34,6 @@ HEADERS = {
     "Connection": "keep-alive",
     "Cache-Control": "no-cache",
     "Pragma": "no-cache",
-    "Referer": REFERER_URL,
     "Sec-Fetch-Dest": "empty",
     "Sec-Fetch-Mode": "cors",
     "Sec-Fetch-Site": "same-origin",
@@ -45,7 +44,7 @@ HEADERS = {
 CHECK_INTERVAL = 15  # Check every 15 seconds
 STATE_FILE = "state.json"
 
-# Button URLs - ALL from environment variables
+# Button URLs
 DEVELOPER_URL = "https://t.me/botcasx"
 NUMBERS_URL_1 = os.getenv("NUMBERS_URL_1", "https://t.me/alltgmethod11")
 NUMBERS_URL_2 = os.getenv("NUMBERS_URL_2", "https://t.me/CyberOTPCore")
@@ -104,8 +103,8 @@ def mask_phone_number(number):
     if len(cleaned) < 7:
         return cleaned  # Too short to mask
     
-    # For Somalia numbers like 252652015847
-    # Format: 252***5847 (show country code + last 4 digits)
+    # For Somalia numbers like 252650118240
+    # Format: 252***8240 (show country code + last 4 digits)
     if cleaned.startswith("252") and len(cleaned) > 6:
         # Keep first 3 digits (country code) and last 4 digits
         return f"{cleaned[:3]}***{cleaned[-4:]}"
@@ -121,13 +120,18 @@ def extract_otp(text):
     if not text:
         return "N/A"
     
+    # Signal codes
+    signal_match = re.search(r'#?SIGNAL code\s+(\d{4,8})', text, re.IGNORECASE)
+    if signal_match:
+        return signal_match.group(1)
+    
     # Telegram codes
-    telegram_match = re.search(r'Telegram code\s+(\d{4,8})', text)
+    telegram_match = re.search(r'Telegram code\s+(\d{4,8})', text, re.IGNORECASE)
     if telegram_match:
         return telegram_match.group(1)
     
     # WhatsApp codes
-    whatsapp_match = re.search(r'WhatsApp code\s+(\d{4,8})', text)
+    whatsapp_match = re.search(r'WhatsApp code\s+(\d{4,8})', text, re.IGNORECASE)
     if whatsapp_match:
         return whatsapp_match.group(1)
     
@@ -164,9 +168,8 @@ def clean_phone_number(number):
 def build_payload():
     """Build AJAX payload for PSCall.net CLIENT interface (7 columns)"""
     today = datetime.now()
-    yesterday = today - timedelta(days=1)
     
-    fdate1 = yesterday.strftime("%Y-%m-%d 00:00:00")
+    fdate1 = today.strftime("%Y-%m-%d 00:00:00")
     fdate2 = today.strftime("%Y-%m-%d 23:59:59")
     timestamp = int(time.time() * 1000)
     
@@ -183,8 +186,8 @@ def build_payload():
         "fgcli": "",
         "fg": 0,
         "sEcho": 1,
-        "iColumns": 7,  # 7 columns for client interface
-        "sColumns": ",,,,,,",  # 6 commas for 7 columns
+        "iColumns": 7,
+        "sColumns": ",,,,,,",
         "iDisplayStart": 0,
         "iDisplayLength": 25,
         "mDataProp_0": 0,
@@ -233,10 +236,10 @@ def build_payload():
     return params
 
 def format_message(row):
-    """Format SMS data into HTML Telegram message for PSCall.net CLIENT interface (7 columns)"""
+    """Format SMS data into HTML Telegram message"""
     try:
         # PSCall.net CLIENT interface has 7 columns
-        # Based on sample: [date, route, number, service, message, currency, cost]
+        # [date, route, number, service, message, currency, cost]
         date = row[0] if len(row) > 0 else "N/A"
         route = row[1] if len(row) > 1 else "Unknown"
         number = clean_phone_number(row[2]) if len(row) > 2 else "N/A"
@@ -246,10 +249,10 @@ def format_message(row):
         # Extract country from route
         country = "Unknown"
         if route and isinstance(route, str):
-            # Remove any numbers/dashes and take first word
-            country_parts = re.split(r'[\d-]', route, 1)
-            if country_parts and country_parts[0].strip():
-                country = country_parts[0].strip()
+            # Take first word as country
+            country_parts = route.split()
+            if country_parts:
+                country = country_parts[0]
         
         # Extract OTP
         otp = extract_otp(message)
@@ -267,7 +270,7 @@ def format_message(row):
         safe_country = html.escape(str(country))
         safe_date = html.escape(str(date))
         
-        # Format message
+        # Format message - preserve newlines
         safe_message = html.escape(str(message))
         
         # Format as HTML with newlines
@@ -296,13 +299,11 @@ def create_keyboard():
     """Create inline keyboard with 5 buttons"""
     return {
         "inline_keyboard": [
-            # First row: 3 buttons
             [
                 {"text": "🧑‍💻 Dev", "url": DEVELOPER_URL},
                 {"text": "📱 Numbers 1", "url": NUMBERS_URL_1},
                 {"text": "📱 Numbers 2", "url": NUMBERS_URL_2}
             ],
-            # Second row: 2 buttons
             [
                 {"text": "🆘 Support 1", "url": SUPPORT_URL_1},
                 {"text": "🆘 Support 2", "url": SUPPORT_URL_2}
@@ -311,7 +312,7 @@ def create_keyboard():
     }
 
 def send_telegram(text, chat_id, retry_count=3):
-    """Send message to specific Telegram chat with retry"""
+    """Send message to Telegram chat with retry"""
     if not text:
         return False
     
@@ -331,79 +332,88 @@ def send_telegram(text, chat_id, retry_count=3):
             if response.status_code == 200:
                 return True
             else:
-                error_data = response.json()
-                logging.error(f"Telegram API error (attempt {attempt+1}/{retry_count}): {error_data.get('description', 'Unknown error')}")
                 if attempt < retry_count - 1:
-                    time.sleep(2)  # Wait before retry
+                    time.sleep(2)
         except Exception as e:
-            logging.error(f"Error sending to Telegram (attempt {attempt+1}/{retry_count}): {e}")
             if attempt < retry_count - 1:
                 time.sleep(2)
+            else:
+                logging.error(f"Error sending to Telegram: {e}")
     
     return False
 
 # ================= CORE LOGIC =================
 
 def check_session_valid():
-    """Check if the session is still valid by making a test request"""
+    """Check if the session is still valid by testing the API directly"""
     try:
-        # Try to access the main page first
-        test_response = session.get(REFERER_URL, timeout=10)
+        # Test with a simple request
+        params = build_payload()
+        # Reduce display length for test
+        params["iDisplayLength"] = 5
         
-        if test_response.status_code != 200:
-            logging.error(f"Session check failed: HTTP {test_response.status_code}")
+        response = session.get(AJAX_URL, params=params, timeout=10)
+        
+        if response.status_code == 200:
+            # Try to parse as JSON
+            try:
+                data = response.json()
+                # Check if we have the expected structure
+                if "aaData" in data:
+                    return True
+                else:
+                    logging.error("Session test: Invalid JSON structure")
+                    return False
+            except json.JSONDecodeError:
+                # Might be HTML login page
+                if "<!DOCTYPE html" in response.text[:100].lower():
+                    logging.error("Session test: Got HTML page (likely login required)")
+                    return False
+                logging.error("Session test: JSON decode error")
+                return False
+        else:
+            logging.error(f"Session test: HTTP {response.status_code}")
             return False
-        
-        # Check if we're redirected to login page
-        if "login" in test_response.url.lower() or "index.php" in test_response.url.lower():
-            logging.error("Session expired: Redirected to login page")
-            return False
-        
-        return True
+            
     except Exception as e:
-        logging.error(f"Session check error: {e}")
+        logging.error(f"Session test error: {e}")
         return False
 
 def fetch_latest_sms():
-    """Fetch latest SMS from PSCall.net website"""
+    """Fetch latest SMS from PSCall.net"""
     global STATE
     
     try:
-        # First check if session is valid
+        # Check session first
         if not check_session_valid():
-            logging.error("Session invalid. Please update PHPSESSID in environment variables.")
+            logging.error("Session invalid or expired. Please update PHPSESSID.")
             return
         
         params = build_payload()
         
-        logging.info(f"Fetching data from PSCall.net")
+        logging.info("Fetching SMS data from PSCall.net...")
         response = session.get(AJAX_URL, params=params, timeout=30)
         
         if response.status_code != 200:
             logging.error(f"HTTP Error: {response.status_code}")
-            logging.debug(f"Response text: {response.text[:500]}")
             return
         
-        # Log response headers for debugging
-        logging.debug(f"Response Content-Type: {response.headers.get('Content-Type', 'Unknown')}")
-        logging.debug(f"Response Length: {len(response.text)}")
-        
-        # Check if response is HTML (login page)
-        if 'text/html' in response.headers.get('Content-Type', '').lower():
-            logging.error("Received HTML response instead of JSON. Session may be expired.")
-            logging.debug(f"HTML response start: {response.text[:200]}")
+        # Check content type
+        content_type = response.headers.get('Content-Type', '')
+        if 'text/html' in content_type.lower():
+            logging.error("Received HTML instead of JSON. Session may be expired.")
             return
         
         try:
             data = response.json()
         except json.JSONDecodeError as e:
             logging.error(f"JSON decode error: {e}")
-            logging.debug(f"Raw response (first 500 chars): {response.text[:500]}")
+            logging.debug(f"Response preview: {response.text[:200]}")
             return
         
         rows = data.get("aaData", [])
         if not rows:
-            logging.debug("No data found in response")
+            logging.info("No SMS data found")
             return
         
         logging.info(f"Found {len(rows)} total rows")
@@ -414,8 +424,8 @@ def fetch_latest_sms():
             if not isinstance(row, list) or len(row) < 5:
                 continue
             
-            # Skip summary rows (they start with "0,0.01,0," for PSCall.net)
-            if isinstance(row[0], str) and row[0].startswith("0,0.01,0,"):
+            # Skip summary rows (they start with "0,0,0," for PSCall.net)
+            if isinstance(row[0], str) and row[0].startswith("0,"):
                 continue
             
             # Check for valid date format
@@ -448,7 +458,7 @@ def fetch_latest_sms():
             logging.debug("No new SMS found")
             return
         
-        logging.info(f"New SMS detected: {newest[2]} at {newest[0]}")
+        logging.info(f"📨 New SMS detected: {newest[2]} at {newest[0]}")
         
         # Format message
         formatted_msg = format_message(newest)
@@ -464,7 +474,7 @@ def fetch_latest_sms():
                 time.sleep(1)  # Small delay between sends
         
         if success_count > 0:
-            logging.info(f"OTP sent to {success_count} chats for {newest[2]}")
+            logging.info(f"✅ OTP sent to {success_count} chats")
             
             # Update state
             STATE["last_uid"] = sms_id
@@ -484,8 +494,6 @@ def fetch_latest_sms():
         logging.error(f"Network error: {e}")
     except Exception as e:
         logging.error(f"Unexpected error: {e}")
-        import traceback
-        traceback.print_exc()
 
 def check_environment():
     """Check if all required environment variables are set"""
@@ -508,8 +516,8 @@ def print_config():
     logging.info("=" * 60)
     logging.info("🚀 PSCall.net OTP BOT STARTED")
     logging.info("=" * 60)
-    logging.info(f"Website: PSCall.net (Client Interface)")
-    logging.info(f"URL: {AJAX_URL}")
+    logging.info(f"Website: PSCall.net")
+    logging.info(f"API URL: {AJAX_URL}")
     logging.info(f"Chat IDs: {', '.join(CHAT_IDS)}")
     logging.info(f"Check Interval: {CHECK_INTERVAL} seconds")
     logging.info(f"Mask Phone Numbers: {MASK_PHONE}")
@@ -526,39 +534,6 @@ def print_config():
     logging.info(f"5. 🆘 Support 2: {SUPPORT_URL_2}")
     logging.info("=" * 60)
 
-def test_connection():
-    """Test connection to PSCall.net"""
-    logging.info("Testing connection to PSCall.net...")
-    
-    try:
-        # First test session
-        if check_session_valid():
-            logging.info("✓ Session is valid")
-        else:
-            logging.error("✗ Session is invalid. Please update PHPSESSID.")
-            return False
-        
-        # Test API call
-        params = build_payload()
-        response = session.get(AJAX_URL, params=params, timeout=15)
-        
-        if response.status_code == 200:
-            try:
-                data = response.json()
-                rows = len(data.get("aaData", []))
-                logging.info(f"✓ API connection successful ({rows} rows found)")
-                return True
-            except json.JSONDecodeError:
-                logging.error("✗ API returned non-JSON response")
-                return False
-        else:
-            logging.error(f"✗ API connection failed: HTTP {response.status_code}")
-            return False
-            
-    except Exception as e:
-        logging.error(f"✗ Connection test failed: {e}")
-        return False
-
 # ================= MAIN =================
 
 def main():
@@ -570,12 +545,13 @@ def main():
     
     print_config()
     
-    # Test connection
-    if not test_connection():
-        logging.error("Connection test failed. Please check your configuration.")
-        logging.error("1. Make sure PHPSESSID is correct")
-        logging.error("2. Make sure you're logged into PSCall.net")
-        logging.error("3. Check if the website is accessible")
+    # Test session
+    logging.info("Testing session...")
+    if check_session_valid():
+        logging.info("✅ Session is valid")
+    else:
+        logging.error("❌ Session is invalid. Please check PHPSESSID.")
+        logging.error("Get new PHPSESSID from browser after logging into PSCall.net")
         return
     
     # Main loop
@@ -595,7 +571,7 @@ def main():
             logging.error(f"Error in main loop ({error_count}/{max_errors}): {e}")
             
             if error_count >= max_errors:
-                logging.error("Too many consecutive errors. Waiting 60 seconds...")
+                logging.error("Too many errors. Waiting 60 seconds...")
                 time.sleep(60)
                 error_count = 0
         
